@@ -1,6 +1,6 @@
 # Profile maintenance
 
-Source for the public profile README at `benhammoush/benhammoush`. Edit `profile.json` for personal details and update the README text alternative to match. The original Matrix animation combines green character rain and the information panel into a GIF; a static PNG is included for people who prefer no animation.
+Source for the public profile README at `benhammoush/benhammoush`. Edit `profile.json` for personal details. The original Matrix animation combines green character rain and the information panel into a GIF; a static PNG is saved in `assets/profile.png`.
 
 ## Counting rules
 
@@ -30,4 +30,4 @@ Only public repository endpoints/filters are used, even if the local token has p
 
 The workflow runs at approximately **05:23 UTC daily** or via **Run workflow**. It installs the pinned Pillow dependency, runs offline tests, fetches stats, and generates the 80-frame, 12-second GIF and static PNG. Its built-in `GITHUB_TOKEN` is sufficient; no personal access token is required. API failures, rate limits, incomplete searches, or render/validation errors fail before replacing existing output. Only changed `assets/profile.gif`, `assets/profile.png`, and `assets/stats.json` are committed.
 
-GitHub may delay schedules, cache images, or disable scheduled workflows in inactive public repositories after 60 days. Branch protection may prevent the workflow from pushing; inspect Actions failures rather than weakening protections automatically. GIF animation cannot reliably respect reduced-motion settings in GitHub READMEs, so the README provides a static version. Image text is rasterized and email inside the image is not clickable; an accessible text alternative and mail link are provided beneath it.
+GitHub may delay schedules, cache images, or disable scheduled workflows in inactive public repositories after 60 days. Branch protection may prevent the workflow from pushing; inspect Actions failures rather than weakening protections automatically. GIF animation cannot reliably respect reduced-motion settings in GitHub READMEs. The README intentionally shows only the animation, with empty alt text at the owner's request; profile information is not exposed to screen readers through that image. The static PNG and stats JSON are available directly in `assets`. Image text is rasterized and email inside the image is not clickable.
