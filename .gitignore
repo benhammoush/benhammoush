@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.preview.html
+.ruff_cache/
