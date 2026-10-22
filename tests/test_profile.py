@@ -252,7 +252,7 @@ class MatrixTests(unittest.TestCase):
         self.assertLess(contents.index("Repos"), contents.index("PRs"))
         self.assertLess(contents.index("PRs"), contents.index("Commits"))
         self.assertIn("999 (", contents)
-        self.assertIn(" · 24h)", contents)
+        self.assertNotIn(" · 24h)", contents)
         self.assertIn(
             ("+12", "#54ff89"), [(call.args[1], call.kwargs["fill"]) for call in calls]
         )

@@ -68,7 +68,7 @@ def information(profile, stats):
         (f"+{stats['recent_additions']:,}", green),
         (" / ", value),
         (f"-{stats['recent_deletions']:,}", "#ff7b81"),
-        (" · 24h)", value),
+        (")", value),
     ]:
         text(x, 522, content, color)
         x += face.getlength(content)
