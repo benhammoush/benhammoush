@@ -1,4 +1,4 @@
-"""Offline checks for public counting, failure preservation, and Matrix output."""
+"""Offline checks for aggregate counting, failure preservation, and Matrix output."""
 
 import hashlib
 import tempfile
@@ -74,23 +74,37 @@ class StatsTests(unittest.TestCase):
 
         def request(path, payload=None):
             calls.append((path, payload))
-            if path == "users/test":
-                return {"node_id": "USER"}
-            if path.startswith("users/"):
+            if path == "user":
+                return {"login": "TEST", "node_id": "USER"}
+            if path.startswith("user/repos?"):
+                self.assertIn("affiliation=owner&visibility=all", path)
                 if "&page=1" in path:
                     return [
                         repo("one"),
                         repo("test"),
                         repo("empty", size=0),
                         repo("secret", private=True),
-                        repo("fork", fork=True),
+                        repo("fork", fork=True, private=True),
                     ] + [repo(f"f{i}", fork=True) for i in range(95)]
                 return [repo("two", size=0)]
             if path.startswith("search/"):
-                self.assertIn("is%3Apublic", path)
+                self.assertNotIn("is%3Apublic", path)
+                self.assertNotIn("is%3Aprivate", path)
+                self.assertIn("is%3Apr%20author%3Atest", path)
                 return {"total_count": 9, "incomplete_results": False}
             variables = payload["variables"]
             self.assertEqual(variables["author"], "USER")
+            if variables["name"] == "secret":
+                result = history(
+                    [{
+                        "oid": "PRIVATE",
+                        "additions": 50,
+                        "deletions": 5,
+                        "committedDate": "2026-10-22T11:00:00Z",
+                    }]
+                )
+                result["data"]["repository"]["isPrivate"] = True
+                return result
             if variables["name"] == "empty":
                 return {
                     "data": {
@@ -117,19 +131,19 @@ class StatsTests(unittest.TestCase):
         self.assertEqual(
             profile.collect("test", request, NOW),
             stats(
-                repos=4,
-                commits=2,
+                repos=5,
+                commits=3,
                 prs=9,
                 recent_prs=9,
-                recent_commits=1,
-                additions=20,
-                deletions=6,
-                lines=14,
-                recent_additions=10,
-                recent_deletions=3,
+                recent_commits=2,
+                additions=70,
+                deletions=11,
+                lines=59,
+                recent_additions=60,
+                recent_deletions=8,
             ),
         )
-        self.assertEqual(len([call for call in calls if call[0] == "graphql"]), 4)
+        self.assertEqual(len([call for call in calls if call[0] == "graphql"]), 5)
 
     def test_recent_boundaries_future_dates_offsets_and_deduplication(self):
         dates = [
@@ -145,9 +159,9 @@ class StatsTests(unittest.TestCase):
         ]
 
         def request(path, payload=None):
-            if path == "users/test":
-                return {"node_id": "USER"}
-            if path.startswith("users/"):
+            if path == "user":
+                return {"login": "test", "node_id": "USER"}
+            if path.startswith("user/repos?"):
                 return [repo("one")]
             if path == "graphql":
                 return history(nodes + [nodes[1]])
@@ -168,20 +182,44 @@ class StatsTests(unittest.TestCase):
             (5, 10, 7),
         )
 
-    def test_rejects_partial_search_and_changed_visibility(self):
-        for private in (True, False):
+    def test_rejects_partial_search_and_unavailable_repository(self):
+        for unavailable in (True, False):
 
-            def request(path, payload=None, private=private):
-                if path == "users/test":
-                    return {"node_id": "USER"}
-                if path.startswith("users/"):
-                    return [repo("one")] if private else []
+            def request(path, payload=None, unavailable=unavailable):
+                if path == "user":
+                    return {"login": "test", "node_id": "USER"}
+                if path.startswith("user/repos?"):
+                    return [repo("one")] if unavailable else []
                 if path == "graphql":
-                    return {"data": {"repository": {"isPrivate": True}}}
+                    return {"data": {"repository": None}}
                 return {"total_count": 3, "incomplete_results": True}
 
             with self.assertRaises(RuntimeError):
                 profile.collect("test", request, NOW)
+
+    def test_wrong_account_preserves_outputs_before_listing_repositories(self):
+        """Reject another user's token before accessing or publishing their stats."""
+        calls = []
+
+        def request(path, payload=None):
+            calls.append(path)
+            return {"login": "someone-else", "node_id": "OTHER"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "profile.json").write_text('{"username":"test"}')
+            (root / "assets").mkdir()
+            for name in ("profile.gif", "profile.png", "stats.json"):
+                (root / "assets" / name).write_text("previous")
+            with self.assertRaisesRegex(RuntimeError, "must belong"):
+                profile.refresh(root, request)
+            self.assertEqual(calls, ["user"])
+            self.assertTrue(
+                all(
+                    path.read_text() == "previous"
+                    for path in (root / "assets").iterdir()
+                )
+            )
 
     def test_api_and_render_failures_preserve_all_outputs(self):
         for failure in ("fetch", "render"):
@@ -218,9 +256,9 @@ class StatsTests(unittest.TestCase):
 
         def request(path, payload=None):
             nonlocal searches
-            if path == "users/test":
-                return {"node_id": "USER"}
-            if path.startswith("users/"):
+            if path == "user":
+                return {"login": "test", "node_id": "USER"}
+            if path.startswith("user/repos?"):
                 return []
             searches += 1
             return {"total_count": 9, "incomplete_results": searches == 2}

@@ -1,4 +1,4 @@
-"""Collect public-only GitHub stats and refresh the Matrix profile."""
+"""Collect token-visible GitHub stats and publish aggregate profile totals."""
 
 import json
 import os
@@ -14,7 +14,6 @@ ROOT = Path(__file__).resolve().parent
 HISTORY = """
 query($owner: String!, $name: String!, $author: ID!, $cursor: String, $ref: String!) {
   repository(owner: $owner, name: $name) {
-    isPrivate
     isEmpty
     object(expression: $ref) { ... on Commit {
       oid
@@ -51,12 +50,17 @@ def api(path, payload=None):
 def collect(username, request=api, now=None):
     now = (now or datetime.now(UTC)).replace(microsecond=0)
     cutoff = now - timedelta(hours=24)
-    author = request(f"users/{username}")["node_id"]
+    user = request("user")
+    if user["login"].lower() != username.lower():
+        raise RuntimeError("GITHUB_TOKEN must belong to the profile's GitHub account.")
+    author = user["node_id"]
     repos = []
     page = 1
     while True:
-        batch = request(f"users/{username}/repos?type=owner&per_page=100&page={page}")
-        repos.extend(repo for repo in batch if not repo["private"] and not repo["fork"])
+        batch = request(
+            f"user/repos?affiliation=owner&visibility=all&per_page=100&page={page}"
+        )
+        repos.extend(repo for repo in batch if not repo["fork"])
         if len(batch) < 100:
             break
         page += 1
@@ -82,9 +86,9 @@ def collect(username, request=api, now=None):
                     },
                 },
             )["data"]["repository"]
-            if data is None or data["isPrivate"]:
+            if data is None:
                 raise RuntimeError(
-                    "Repository visibility changed; refusing a partial refresh."
+                    "Repository unavailable; refusing a partial refresh."
                 )
             if data["isEmpty"]:
                 break
@@ -116,7 +120,7 @@ def collect(username, request=api, now=None):
             raise RuntimeError("Incomplete PR search; refusing a partial refresh.")
         return result["total_count"]
 
-    base_query = f"is:pr author:{username} is:public"
+    base_query = f"is:pr author:{username}"
     prs = pr_count(base_query)
     start = cutoff.isoformat().replace("+00:00", "Z")
     end = now.isoformat().replace("+00:00", "Z")
@@ -155,7 +159,7 @@ def refresh(root=ROOT, request=api):
         )
         for name in ("profile.gif", "profile.png", "stats.json"):
             (temporary / name).replace(assets / name)
-    print("Updated public stats:", json.dumps(stats))
+    print("Updated aggregate stats:", json.dumps(stats))
 
 
 if __name__ == "__main__":
