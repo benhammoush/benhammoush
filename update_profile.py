@@ -19,7 +19,7 @@ query($owner: String!, $name: String!, $author: ID!, $cursor: String, $ref: Stri
     isEmpty
     object(expression: $ref) { ... on Commit {
       oid
-      history(first: 100, author: {id: $author}, after: $cursor) {
+      history(first: 10, author: {id: $author}, after: $cursor) {
         nodes { oid additions deletions committedDate }
         pageInfo { hasNextPage endCursor }
       }

@@ -161,6 +161,8 @@ class StatsTests(unittest.TestCase):
                 self.assertNotIn("is%3Aprivate", path)
                 self.assertIn("is%3Apr%20author%3Atest", path)
                 return {"total_count": 9, "incomplete_results": False}
+            self.assertIn("history(first: 10,", payload["query"])
+            self.assertIn("oid additions deletions committedDate", payload["query"])
             variables = payload["variables"]
             self.assertEqual(variables["author"], "USER")
             if variables["name"] == "secret":
