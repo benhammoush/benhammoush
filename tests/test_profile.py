@@ -1,11 +1,13 @@
 """Offline checks for aggregate counting, failure preservation, and Matrix output."""
 
 import hashlib
+import io
 import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
+from urllib.error import HTTPError
 
 from PIL import Image
 
@@ -66,6 +68,73 @@ def history(nodes, more=False):
             }
         }
     }
+
+
+class ApiTests(unittest.TestCase):
+    """Check bounded retries without contacting GitHub or waiting."""
+
+    def test_transient_http_errors_retry_the_same_request(self):
+        """Temporary server failures recover with exponential backoff."""
+        for code in (500, 502, 503, 504):
+            errors = [
+                HTTPError("https://api.github.com/graphql", code, "error", {}, None)
+                for _ in range(3)
+            ]
+            with (
+                self.subTest(code=code),
+                patch.dict("os.environ", {"GITHUB_TOKEN": "test-token"}),
+                patch.object(
+                    profile.urllib.request,
+                    "urlopen",
+                    side_effect=errors + [io.BytesIO(b'{"data": {}}')],
+                ) as urlopen,
+                patch.object(profile.time, "sleep") as sleep,
+            ):
+                self.assertEqual(profile.api("graphql", {"query": "test"}), {"data": {}})
+                self.assertEqual(urlopen.call_count, 4)
+                self.assertTrue(all(
+                    item == urlopen.call_args_list[0]
+                    for item in urlopen.call_args_list
+                ))
+                self.assertEqual(sleep.call_args_list, [call(2), call(4), call(8)])
+
+    def test_persistent_or_nontransient_http_errors_raise(self):
+        """Retries stop at four attempts; client errors are never retried."""
+        for code in (500, 502, 503, 504, 400, 401, 403, 404, 429):
+            error = HTTPError("https://api.github.com/graphql", code, "error", {}, None)
+            with (
+                self.subTest(code=code),
+                patch.dict("os.environ", {"GITHUB_TOKEN": "test-token"}),
+                patch.object(
+                    profile.urllib.request, "urlopen", side_effect=error
+                ) as urlopen,
+                patch.object(profile.time, "sleep") as sleep,
+                self.assertRaises(HTTPError) as raised,
+            ):
+                profile.api("graphql", {"query": "test"})
+            self.assertIs(raised.exception, error)
+            transient = code in (500, 502, 503, 504)
+            self.assertEqual(urlopen.call_count, 4 if transient else 1)
+            self.assertEqual(
+                sleep.call_args_list,
+                [call(2), call(4), call(8)] if transient else [],
+            )
+
+    def test_graphql_errors_are_not_retried(self):
+        """Partial GraphQL results still fail closed without retries."""
+        with (
+            patch.dict("os.environ", {"GITHUB_TOKEN": "test-token"}),
+            patch.object(
+                profile.urllib.request,
+                "urlopen",
+                return_value=io.BytesIO(b'{"data": {}, "errors": [{}]}'),
+            ) as urlopen,
+            patch.object(profile.time, "sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, "GraphQL errors"),
+        ):
+            profile.api("graphql", {"query": "test"})
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
 
 
 class StatsTests(unittest.TestCase):

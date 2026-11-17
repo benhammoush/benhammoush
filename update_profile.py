@@ -3,6 +3,8 @@
 import json
 import os
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import UTC, datetime, timedelta
@@ -28,6 +30,7 @@ query($owner: String!, $name: String!, $author: ID!, $cursor: String, $ref: Stri
 
 
 def api(path, payload=None):
+    """Read GitHub data, retrying temporary HTTP failures up to three times."""
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         raise RuntimeError("Set GITHUB_TOKEN to an authenticated GitHub token.")
@@ -40,8 +43,16 @@ def api(path, payload=None):
             "User-Agent": "benhammoush-profile",
         },
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        result = json.load(response)
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                result = json.load(response)
+            break
+        except urllib.error.HTTPError as error:
+            if error.code not in (500, 502, 503, 504) or attempt == 3:
+                raise
+            error.close()
+            time.sleep(2 ** (attempt + 1))
     if isinstance(result, dict) and result.get("errors"):
         raise RuntimeError("GitHub returned GraphQL errors; keeping previous panels.")
     return result
