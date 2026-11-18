@@ -1,12 +1,12 @@
 {
   "repos": 18,
-  "commits": 1346,
+  "commits": 1359,
   "prs": 305,
   "recent_prs": 0,
-  "recent_commits": 0,
+  "recent_commits": 13,
   "recent_additions": 0,
-  "recent_deletions": 0,
-  "additions": 35490280,
-  "deletions": 27442397,
-  "lines": 8047883
+  "recent_deletions": 23634668,
+  "additions": 35490279,
+  "deletions": 33959499,
+  "lines": 1530780
 }
