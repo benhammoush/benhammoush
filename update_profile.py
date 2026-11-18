@@ -13,6 +13,7 @@ from pathlib import Path
 from generate_matrix import generate
 
 ROOT = Path(__file__).resolve().parent
+TRANSIENT_HTTP_ERRORS = (500, 502, 503, 504)
 HISTORY = """
 query($owner: String!, $name: String!, $author: ID!, $cursor: String, $ref: String!) {
   repository(owner: $owner, name: $name) {
@@ -27,6 +28,10 @@ query($owner: String!, $name: String!, $author: ID!, $cursor: String, $ref: Stri
   }
 }
 """
+
+
+class GraphQLUnavailable(RuntimeError):
+    """GitHub could not resolve a query because its service was unavailable."""
 
 
 def api(path, payload=None):
@@ -49,11 +54,13 @@ def api(path, payload=None):
                 result = json.load(response)
             break
         except urllib.error.HTTPError as error:
-            if error.code not in (500, 502, 503, 504) or attempt == 3:
+            if error.code not in TRANSIENT_HTTP_ERRORS or attempt == 3:
                 raise
             error.close()
             time.sleep(2 ** (attempt + 1))
     if isinstance(result, dict) and result.get("errors"):
+        if all(error.get("type") == "SERVICE_UNAVAILABLE" for error in result["errors"]):
+            raise GraphQLUnavailable("GitHub GraphQL service unavailable.")
         raise RuntimeError("GitHub returned GraphQL errors; keeping previous panels.")
     return result
 
@@ -84,19 +91,33 @@ def collect(username, request=api, now=None):
         cursor = None
         ref = "refs/heads/" + (repo["default_branch"] or "main")
         while True:
-            data = request(
-                "graphql",
-                {
-                    "query": HISTORY,
-                    "variables": {
-                        "owner": username,
-                        "name": repo["name"],
-                        "author": author,
-                        "cursor": cursor,
-                        "ref": ref,
-                    },
+            payload = {
+                "query": HISTORY,
+                "variables": {
+                    "owner": username,
+                    "name": repo["name"],
+                    "author": author,
+                    "cursor": cursor,
+                    "ref": ref,
                 },
-            )["data"]["repository"]
+            }
+            use_rest = False
+            try:
+                data = request("graphql", payload)["data"]["repository"]
+            except (urllib.error.HTTPError, GraphQLUnavailable) as error:
+                if isinstance(error, urllib.error.HTTPError):
+                    if error.code not in TRANSIENT_HTTP_ERRORS:
+                        raise
+                    error.close()
+                # Recover the same page without the unreliable line-count fields.
+                payload = {
+                    **payload,
+                    "query": HISTORY.replace(
+                        "oid additions deletions committedDate", "oid committedDate"
+                    ),
+                }
+                data = request("graphql", payload)["data"]["repository"]
+                use_rest = True
             if data is None:
                 raise RuntimeError(
                     "Repository unavailable; refusing a partial refresh."
@@ -112,9 +133,24 @@ def collect(username, request=api, now=None):
             ref = commit["oid"]
             history = commit["history"]
             for node in history["nodes"]:
+                if node["oid"] in seen:
+                    continue
+                counts = node
+                if use_rest:
+                    details = request(
+                        f"repos/{username}/{repo['name']}/commits/{node['oid']}"
+                    )
+                    counts = details.get("stats") or {}
+                    if details.get("sha") != node["oid"] or any(
+                        type(counts.get(field)) is not int or counts[field] < 0
+                        for field in ("additions", "deletions")
+                    ):
+                        raise RuntimeError(
+                            "Invalid REST commit statistics; refusing a partial refresh."
+                        )
                 seen[node["oid"]] = (
-                    node["additions"],
-                    node["deletions"],
+                    counts["additions"],
+                    counts["deletions"],
                     datetime.fromisoformat(node["committedDate"]),
                 )
             info = history["pageInfo"]

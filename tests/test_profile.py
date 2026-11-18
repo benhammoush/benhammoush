@@ -136,8 +136,157 @@ class ApiTests(unittest.TestCase):
         urlopen.assert_called_once()
         sleep.assert_not_called()
 
+    def test_only_service_unavailable_errors_allow_fallback(self):
+        """Never classify mixed authentication or rate-limit errors as recoverable."""
+        for errors, expected in (
+            ([{"type": "SERVICE_UNAVAILABLE"}], profile.GraphQLUnavailable),
+            ([{"type": "SERVICE_UNAVAILABLE"}, {"type": "FORBIDDEN"}], RuntimeError),
+            ([{"type": "RATE_LIMITED"}], RuntimeError),
+            ([{}], RuntimeError),
+        ):
+            with (
+                self.subTest(errors=errors),
+                patch.dict("os.environ", {"GITHUB_TOKEN": "test-token"}),
+                patch.object(
+                    profile.urllib.request,
+                    "urlopen",
+                    return_value=io.BytesIO(
+                        profile.json.dumps({"errors": errors}).encode()
+                    ),
+                ),
+                self.assertRaises(expected) as raised,
+            ):
+                profile.api("graphql", {"query": "test"})
+            self.assertIs(type(raised.exception), expected)
+
 
 class StatsTests(unittest.TestCase):
+    def test_unavailable_line_counts_use_rest_with_pinned_pagination(self):
+        """Recover only the failed page, retaining dates, tip and SHA deduplication."""
+        for failure in (
+            profile.GraphQLUnavailable("unavailable"),
+            *(HTTPError("https://api.github.com/graphql", code, "error", {}, None)
+              for code in (500, 502, 503, 504)),
+        ):
+            calls = []
+            recent = {"oid": "B", "committedDate": "2026-10-22T11:00:00Z"}
+            old = {
+                "oid": "A", "additions": 10, "deletions": 3,
+                "committedDate": "2026-10-20T12:00:00Z",
+            }
+
+            def request(
+                path, payload=None, calls=calls, recent=recent, old=old, failure=failure
+            ):
+                """Return a good first page, failing second page and REST recovery."""
+                calls.append((path, payload))
+                if path == "user":
+                    return {"login": "test", "node_id": "USER"}
+                if path.startswith("user/repos?"):
+                    return [repo("one"), repo("two")]
+                if path.startswith("search/"):
+                    return {"total_count": 2, "incomplete_results": False}
+                if path.startswith("repos/"):
+                    self.assertEqual(path, "repos/test/one/commits/B")
+                    return {
+                        "sha": "B", "stats": {"additions": 50, "deletions": 5},
+                        "files": [{"additions": 999}],
+                    }
+                variables = payload["variables"]
+                if variables["name"] == "two":
+                    return history([{**recent, "additions": 50, "deletions": 5}])
+                if variables["cursor"] is None:
+                    self.assertEqual(variables["ref"], "refs/heads/main")
+                    return history([old], more=True)
+                self.assertEqual(variables, {
+                    "owner": "test", "name": "one", "author": "USER",
+                    "cursor": "next", "ref": "TIP",
+                })
+                if "additions deletions" in payload["query"]:
+                    raise failure
+                self.assertIn("history(first: 10,", payload["query"])
+                return history([old, recent, recent])
+
+            with self.subTest(failure=type(failure).__name__):
+                self.assertEqual(profile.collect("test", request, NOW), stats(
+                    repos=2, commits=2, prs=2, recent_prs=2, recent_commits=1,
+                    additions=60, deletions=8, lines=52,
+                    recent_additions=50, recent_deletions=5,
+                ))
+                self.assertEqual(
+                    len([path for path, _ in calls if path.startswith("repos/")]), 1
+                )
+
+    def test_fallback_failures_preserve_outputs(self):
+        """Unavailable metadata, REST errors and invalid counts never publish totals."""
+        cases = (
+            "metadata", "rest", "missing", "null", "negative", "boolean",
+            "string", "wrong_sha",
+        )
+        for failure in cases:
+            def request(path, payload=None, failure=failure):
+                """Fail the recovery stage selected by the current fixture."""
+                if path == "user":
+                    return {"login": "test", "node_id": "USER"}
+                if path.startswith("user/repos?"):
+                    return [repo("one")]
+                if path == "graphql":
+                    if "additions deletions" in payload["query"] or failure == "metadata":
+                        raise profile.GraphQLUnavailable("unavailable")
+                    return history([{
+                        "oid": "A", "committedDate": "2026-10-22T11:00:00Z",
+                    }])
+                if failure == "rest":
+                    raise HTTPError("https://api.github.com", 503, "error", {}, None)
+                counts = {"additions": 5, "deletions": 1}
+                if failure == "missing":
+                    counts.pop("additions")
+                elif failure in ("null", "negative", "boolean", "string"):
+                    counts["additions"] = {
+                        "null": None, "negative": -1, "boolean": True, "string": "5",
+                    }[failure]
+                return {
+                    "sha": "OTHER" if failure == "wrong_sha" else "A",
+                    "stats": counts,
+                }
+
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "profile.json").write_text('{"username":"test"}')
+                (root / "assets").mkdir()
+                for name in ("profile.gif", "profile.png", "stats.json"):
+                    (root / "assets" / name).write_text("previous")
+                with self.assertRaises((RuntimeError, HTTPError)):
+                    profile.refresh(root, request)
+                self.assertTrue(all(
+                    path.read_text() == "previous"
+                    for path in (root / "assets").iterdir()
+                ))
+
+    def test_auth_and_other_errors_do_not_trigger_fallback(self):
+        """Do not conceal permission, rate-limit or unrelated GraphQL failures."""
+        for failure in (
+            RuntimeError("GraphQL error"),
+            *(HTTPError("https://api.github.com/graphql", code, "error", {}, None)
+              for code in (400, 401, 403, 404, 429)),
+        ):
+            graphql_calls = []
+
+            def request(path, payload=None, graphql_calls=graphql_calls, failure=failure):
+                """Allow discovery and fail the original history query."""
+                if path == "user":
+                    return {"login": "test", "node_id": "USER"}
+                if path.startswith("user/repos?"):
+                    return [repo("one")]
+                self.assertEqual(path, "graphql")
+                graphql_calls.append(payload)
+                raise failure
+
+            with self.subTest(failure=type(failure).__name__):
+                with self.assertRaises(type(failure)):
+                    profile.collect("test", request, NOW)
+                self.assertEqual(len(graphql_calls), 1)
+
     def test_pagination_visibility_empty_and_zero_size_repos(self):
         calls = []
 
