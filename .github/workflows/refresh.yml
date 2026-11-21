@@ -22,6 +22,13 @@ jobs:
         with:
           python-version: '3.13'
       - run: python -m pip install -r requirements.txt
+      - name: Install source line counter
+        run: |
+          curl --fail --location --retry 3 \
+            https://raw.githubusercontent.com/AlDanial/cloc/v2.08/cloc \
+            --output "$RUNNER_TEMP/cloc"
+          chmod +x "$RUNNER_TEMP/cloc"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - run: python -m unittest discover -s tests -v
       - run: python update_profile.py
         env:

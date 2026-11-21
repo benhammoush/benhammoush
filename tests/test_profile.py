@@ -161,6 +161,11 @@ class ApiTests(unittest.TestCase):
 
 
 class StatsTests(unittest.TestCase):
+    def setUp(self):
+        counter = patch.object(profile, "snapshot_lines", return_value=100)
+        self.snapshot = counter.start()
+        self.addCleanup(counter.stop)
+
     def test_unavailable_line_counts_use_rest_with_pinned_pagination(self):
         """Recover only the failed page, retaining dates, tip and SHA deduplication."""
         for failure in (
@@ -210,7 +215,7 @@ class StatsTests(unittest.TestCase):
             with self.subTest(failure=type(failure).__name__):
                 self.assertEqual(profile.collect("test", request, NOW), stats(
                     repos=2, commits=2, prs=2, recent_prs=2, recent_commits=1,
-                    additions=60, deletions=8, lines=52,
+                    additions=60, deletions=8, lines=200,
                     recent_additions=50, recent_deletions=5,
                 ))
                 self.assertEqual(
@@ -358,12 +363,15 @@ class StatsTests(unittest.TestCase):
                 recent_commits=2,
                 additions=70,
                 deletions=11,
-                lines=59,
+                lines=300,
                 recent_additions=60,
                 recent_deletions=8,
             ),
         )
         self.assertEqual(len([call for call in calls if call[0] == "graphql"]), 5)
+        self.assertEqual(self.snapshot.call_args_list, [
+            call("test", name, "TIP") for name in ("one", "secret", "two")
+        ])
 
     def test_recent_boundaries_future_dates_offsets_and_deduplication(self):
         dates = [
@@ -399,7 +407,7 @@ class StatsTests(unittest.TestCase):
         )
         self.assertEqual(
             (result["lines"], result["recent_additions"], result["recent_deletions"]),
-            (5, 10, 7),
+            (100, 10, 7),
         )
 
     def test_rejects_partial_search_and_unavailable_repository(self):
@@ -440,6 +448,27 @@ class StatsTests(unittest.TestCase):
                     for path in (root / "assets").iterdir()
                 )
             )
+
+    def test_snapshot_failure_preserves_outputs(self):
+        def request(path, payload=None):
+            if path == "user":
+                return {"login": "test", "node_id": "USER"}
+            if path.startswith("user/repos?"):
+                return [repo("one")]
+            return history([])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "profile.json").write_text('{"username":"test"}')
+            (root / "assets").mkdir()
+            for name in ("profile.gif", "profile.png", "stats.json"):
+                (root / "assets" / name).write_text("previous")
+            self.snapshot.side_effect = RuntimeError("snapshot unavailable")
+            with self.assertRaisesRegex(RuntimeError, "snapshot unavailable"):
+                profile.refresh(root, request)
+            self.assertTrue(all(
+                path.read_text() == "previous" for path in (root / "assets").iterdir()
+            ))
 
     def test_api_and_render_failures_preserve_all_outputs(self):
         for failure in ("fetch", "render"):
@@ -490,6 +519,194 @@ class StatsTests(unittest.TestCase):
                 profile.refresh(root, request)
             self.assertEqual(searches, 2)
             self.assertFalse((root / "assets").exists())
+
+
+class SnapshotTests(unittest.TestCase):
+    def test_git_and_cloc_count_code_without_comments_blanks_or_generated_files(self):
+        """Exercise real Git blobs and cloc, including duplicate paths and MQL5."""
+        with tempfile.TemporaryDirectory() as directory:
+            env = {
+                **{key: value for key, value in profile.os.environ.items()
+                   if not key.upper().startswith("GIT_")},
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": profile.os.devnull,
+            }
+
+            def run(*args, input=None):
+                return profile.subprocess.run(
+                    ["git", "-C", directory, *args], input=input, check=True, env=env,
+                    stdout=profile.subprocess.PIPE, stderr=profile.subprocess.PIPE,
+                    timeout=30,
+                ).stdout
+
+            run("init", "--bare")
+            entries = []
+            for name, mode, content in (
+                ("source.py", "100644", b"# comment\r\n\r\nx = 1\r\ny = 2"),
+                ("duplicate.py", "100644", b"# comment\r\n\r\nx = 1\r\ny = 2"),
+                ("generated.js", "100755", b"// generated\n\ncode\n"),
+                ("robot.mq5", "100644", b"// comment\nvoid OnTick() {}\n"),
+                ("README.md", "100644", b"# Documentation\n\nText\n"),
+                ("config.json", "100644", b'{"key": 1}\n'),
+                ("api.py", "100644", b"# @generated\nx = 1\n"),
+                ("binary.dat", "100644", b"\x00binary\n\n"),
+                ("empty.txt", "100644", b""),
+                ("symlink", "120000", b"source.py"),
+            ):
+                oid = run("hash-object", "-w", "--stdin", input=content).strip()
+                entries.append(mode.encode() + b" blob " + oid + b"\t" + name.encode())
+            tree = run("mktree", input=b"\n".join(entries) + b"\n").strip().decode()
+            self.assertEqual(profile.tracked_lines(tree, run), 5)
+            for suffix in (b"\tREADME.md", b"\tbinary.dat"):
+                empty_source = [entry for entry in entries if entry.endswith(suffix)]
+                tree = run(
+                    "mktree", input=b"\n".join(empty_source) + b"\n"
+                ).strip().decode()
+                self.assertEqual(profile.tracked_lines(tree, run), 0)
+
+    def test_dependency_build_generated_links_and_submodules_are_excluded(self):
+        """Do not export excluded paths or indirect filesystem objects."""
+        paths = [
+            b"100644 blob SHA\tnode_modules/dependency.js\0",
+            b"100644 blob SHA\tvendor/library.py\0",
+            b"100644 blob SHA\tdist/bundle.js\0",
+            b"100644 blob SHA\tgenerated/api.py\0",
+            b"100644 blob SHA\tsrc/api.generated.ts\0",
+            b"100644 blob SHA\tsrc/types.d.ts\0",
+            b"120000 blob SHA\tsymlink.py\0",
+            b"160000 commit SHA\tsubmodule\0",
+        ]
+        run = unittest.mock.Mock(return_value=b"".join(paths))
+        self.assertEqual(profile.tracked_lines("TIP", run), 0)
+        run.assert_called_once_with("ls-tree", "-r", "-z", "TIP")
+
+    def test_empty_tree_and_invalid_batch(self):
+        """Never use partial blob data as a valid snapshot."""
+        self.assertEqual(profile.tracked_lines(
+            "TIP", unittest.mock.Mock(return_value=b"")
+        ), 0)
+        for response in (b"SHA missing\n", b"OTHER blob 1\nx\n", b"SHA blob 10\nx\n"):
+            with self.subTest(response=response), self.assertRaises(RuntimeError):
+                profile.tracked_lines("TIP", unittest.mock.Mock(side_effect=[
+                    b"100644 blob SHA\tfile.py\0", response,
+                ]))
+
+    def test_cloc_failures_and_invalid_reports_raise(self):
+        """Missing tools, timeouts and invalid counts must fail closed."""
+        for result in (
+            FileNotFoundError("private-path"),
+            profile.subprocess.TimeoutExpired("cloc", 900),
+            profile.subprocess.CalledProcessError(1, "cloc"),
+            b"not json", b'{"SUM":{"code":-1},"header":{"n_files":1}}',
+            b'{"SUM":{"code":true},"header":{"n_files":1}}',
+            b'{"SUM":{"code":"1"},"header":{"n_files":1}}',
+            b'{"header":{"n_files":1}}', b'{"header":{"n_files":0}}',
+            b'{"header":null,"SUM":{}}',
+            b'{"header":{"n_files":0},"SUM":{}}',
+            b'{"header":{"n_files":0},"Python":{"code":100}}',
+        ):
+            run = unittest.mock.Mock(side_effect=[
+                b"100644 blob SHA\tfile.py\0", b"SHA blob 4\nx=1\n\n",
+            ])
+            with (
+                self.subTest(result=result),
+                patch.object(
+                    profile.subprocess, "run",
+                    side_effect=result if isinstance(result, Exception) else None,
+                    return_value=profile.subprocess.CompletedProcess([], 0, stdout=result),
+                ),
+                self.assertRaisesRegex(RuntimeError, "Source counting failed"),
+            ):
+                profile.tracked_lines("TIP", run)
+
+    def test_export_is_isolated_and_cloc_keeps_duplicate_paths(self):
+        """Flatten untrusted directories and never pass credentials to cloc."""
+        run = unittest.mock.Mock(side_effect=[
+            b"100644 blob SHA\t../../code.py\0", b"SHA blob 4\nx=1\n\n",
+        ])
+
+        def count(command, **kwargs):
+            """Inspect exports while their temporary directory still exists."""
+            root = Path(command[-1])
+            self.assertEqual((root / "0" / "code.py").read_bytes(), b"x=1\n")
+            self.assertIn("--skip-uniqueness", command)
+            self.assertIn("--config", command)
+            self.assertNotIn("GITHUB_TOKEN", kwargs["env"])
+            return profile.subprocess.CompletedProcess(
+                [], 0, stdout=b'{"header":{"n_files":1},"SUM":{"code":1}}'
+            )
+
+        with patch.object(profile.subprocess, "run", side_effect=count):
+            self.assertEqual(profile.tracked_lines("TIP", run), 1)
+
+    def test_unsafe_basenames_are_rejected_without_exposing_paths(self):
+        """Reject Windows aliases and separators rather than exporting ambiguously."""
+        for name in (b"..", b"CON.py", b"file.py.", b"file\\other.py", b"file:stream.py"):
+            run = unittest.mock.Mock(side_effect=[
+                b"100644 blob SHA\t" + name + b"\0", b"SHA blob 4\nx=1\n\n",
+            ])
+            with self.subTest(name=name), self.assertRaisesRegex(
+                RuntimeError, "^Unsupported source filename; refusing a partial refresh.$"
+            ):
+                profile.tracked_lines("TIP", run)
+
+    def test_source_free_cloc_report_counts_zero(self):
+        """A valid report with no recognized code is a legitimate zero."""
+        run = unittest.mock.Mock(side_effect=[
+            b"100644 blob SHA\tREADME.md\0", b"SHA blob 4\ntext\n",
+        ])
+        with patch.object(
+            profile.subprocess, "run",
+            return_value=profile.subprocess.CompletedProcess([], 0, stdout=b'{}\n'),
+        ):
+            self.assertEqual(profile.tracked_lines("TIP", run), 0)
+
+    def test_fetch_is_pinned_and_credentials_are_not_command_arguments(self):
+        sha = "a" * 40
+        inherited = {
+            "GIT_DIR": "caller-repository",
+            "GIT_WORK_TREE": "caller-worktree",
+            "GIT_OBJECT_DIRECTORY": "caller-objects",
+            "GIT_CONFIG_PARAMETERS": "caller-config",
+            "GIT_TRACE": "caller-trace",
+        }
+        with (
+            patch.dict("os.environ", {"GITHUB_TOKEN": "private-token", **inherited}),
+            patch.object(profile.subprocess, "run", side_effect=[
+                profile.subprocess.CompletedProcess([], 0, stdout=output)
+                for output in (b"", b"", sha.encode() + b"\n")
+            ]) as run,
+            patch.object(profile, "tracked_lines", return_value=42) as count,
+        ):
+            self.assertEqual(profile.snapshot_lines("test", "repo", sha), 42)
+        commands = [item.args[0] for item in run.call_args_list]
+        self.assertEqual(commands[1][-2:], ["https://github.com/test/repo.git", sha])
+        self.assertNotIn("private-token", str(commands))
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["GIT_CONFIG_KEY_0"], "http.https://github.com/.extraheader")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertTrue(all(key not in env for key in inherited))
+        self.assertEqual(count.call_args.args[0], sha)
+
+    def test_git_failures_are_sanitized_and_bad_revisions_rejected(self):
+        for failure in (
+            FileNotFoundError("private-token"),
+            profile.subprocess.CalledProcessError(1, ["private-token"]),
+            profile.subprocess.TimeoutExpired(["private-token"], 900),
+        ):
+            with (
+                self.subTest(failure=type(failure).__name__),
+                patch.dict("os.environ", {"GITHUB_TOKEN": "private-token"}),
+                patch.object(profile.subprocess, "run", side_effect=failure),
+                self.assertRaisesRegex(RuntimeError, "Git snapshot counting failed") as raised,
+            ):
+                profile.snapshot_lines("test", "repo", "a" * 40)
+            self.assertNotIn("private-token", str(raised.exception))
+        with (
+            patch.dict("os.environ", {"GITHUB_TOKEN": "private-token"}),
+            self.assertRaisesRegex(RuntimeError, "Invalid snapshot revision"),
+        ):
+            profile.snapshot_lines("test", "repo", "--bad")
 
 
 class MatrixTests(unittest.TestCase):
